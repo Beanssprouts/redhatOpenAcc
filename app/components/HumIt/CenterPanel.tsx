@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { generateTrack } from '../../../lib/api'
+import { uploadRecording, pollForResult } from '../../../lib/api'
 import { TrackParams } from './types'
 
 interface Props {
@@ -10,20 +10,36 @@ interface Props {
 }
 
 export default function CenterPanel({ params, onGenerated }: Props) {
-  const [recording, setRecording] = useState(false)
-  const [generated, setGenerated] = useState(false)
-  const [playing, setPlaying]     = useState(false)
-  const [seconds, setSeconds]     = useState(0)
-  const [progress, setProgress]   = useState(0)
-  const [status, setStatus]       = useState('Tap the mic to begin')
+  const [recording, setRecording]     = useState(false)
+  const [generated, setGenerated]     = useState(false)
+  const [playing, setPlaying]         = useState(false)
+  const [seconds, setSeconds]         = useState(0)
+  const [progress, setProgress]       = useState(0)
+  const [status, setStatus]           = useState('Tap the mic to begin')
   const [statusColor, setStatusColor] = useState('#bbb')
   const [generating, setGenerating]   = useState(false)
+  const [mp3Url, setMp3Url]           = useState('')
+  const [micError, setMicError]       = useState('')
 
-  const barsRef  = useRef<HTMLDivElement[]>([])
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const waveRef  = useRef<ReturnType<typeof setInterval> | null>(null)
-  const playRef  = useRef<ReturnType<typeof setInterval> | null>(null)
+  // waveform bars
+  const barsRef     = useRef<HTMLDivElement[]>([])
   const waveContRef = useRef<HTMLDivElement>(null)
+  const waveRef     = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // timers / playback
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const playRef  = useRef<ReturnType<typeof setInterval> | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+
+  // recording
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const chunksRef        = useRef<Blob[]>([])
+  const audioBlobRef     = useRef<Blob | null>(null)
+  const mimeTypeRef      = useRef('audio/webm')
+
+  // live amplitude via AnalyserNode
+  const analyserRef  = useRef<AnalyserNode | null>(null)
+  const audioCtxRef  = useRef<AudioContext | null>(null)
 
   // Build waveform bars on mount
   useEffect(() => {
@@ -32,7 +48,8 @@ export default function CenterPanel({ params, onGenerated }: Props) {
     barsRef.current = []
     for (let i = 0; i < 44; i++) {
       const b = document.createElement('div')
-      b.style.cssText = 'width:4px;border-radius:2px;background:#ebebeb;height:3px;transition:height 0.08s,background 0.1s;flex-shrink:0;'
+      b.style.cssText =
+        'width:4px;border-radius:2px;background:#ebebeb;height:3px;transition:height 0.08s,background 0.1s;flex-shrink:0;'
       waveContRef.current.appendChild(b)
       barsRef.current.push(b)
     }
@@ -44,32 +61,92 @@ export default function CenterPanel({ params, onGenerated }: Props) {
       barsRef.current.forEach(b => { b.style.height = '3px'; b.style.background = '#ebebeb' })
       return
     }
-    let t = 0
-    waveRef.current = setInterval(() => {
-      t++
-      barsRef.current.forEach((b, i) => {
-        const h = Math.abs(Math.sin(t * 0.18 + i * 0.38)) * 30 + 3
-        b.style.height = Math.round(h) + 'px'
-        b.style.background = '#e8450a'
-      })
-    }, 55)
+
+    if (analyserRef.current) {
+      // live amplitude from the mic
+      const buf = new Uint8Array(analyserRef.current.frequencyBinCount)
+      waveRef.current = setInterval(() => {
+        analyserRef.current!.getByteTimeDomainData(buf)
+        barsRef.current.forEach((b, i) => {
+          const idx = Math.floor((i / barsRef.current.length) * buf.length)
+          const v = (buf[idx] - 128) / 128
+          const h = Math.abs(v) * 40 + 3
+          b.style.height = Math.round(h) + 'px'
+          b.style.background = '#e8450a'
+        })
+      }, 55)
+    } else {
+      // fallback sine animation
+      let t = 0
+      waveRef.current = setInterval(() => {
+        t++
+        barsRef.current.forEach((b, i) => {
+          const h = Math.abs(Math.sin(t * 0.18 + i * 0.38)) * 30 + 3
+          b.style.height = Math.round(h) + 'px'
+          b.style.background = '#e8450a'
+        })
+      }, 55)
+    }
   }
 
-  function toggleRecord() {
+  async function toggleRecord() {
     if (generated || generating) return
+    setMicError('')
+
     if (!recording) {
+      // --- start recording ---
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      } catch {
+        setMicError('Microphone access denied — please allow it in your browser.')
+        return
+      }
+
+      // live amplitude for waveform
+      const audioCtx = new AudioContext()
+      const source   = audioCtx.createMediaStreamSource(stream)
+      const analyser = audioCtx.createAnalyser()
+      analyser.fftSize = 1024
+      source.connect(analyser)
+      audioCtxRef.current  = audioCtx
+      analyserRef.current  = analyser
+
+      // pick best supported MIME type
+      const mime =
+        MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
+        MediaRecorder.isTypeSupported('audio/webm')             ? 'audio/webm'             :
+        MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')  ? 'audio/ogg;codecs=opus'  :
+        'audio/mp4'
+      mimeTypeRef.current = mime
+
+      chunksRef.current = []
+      const mr = new MediaRecorder(stream, { mimeType: mime })
+      mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
+      mr.onstop = () => {
+        const baseMime = mime.split(';')[0]
+        audioBlobRef.current = new Blob(chunksRef.current, { type: baseMime })
+        stream.getTracks().forEach(t => t.stop())
+        audioCtx.close()
+        analyserRef.current = null
+      }
+      mr.start(100)
+      mediaRecorderRef.current = mr
+
       setRecording(true)
       setSeconds(0)
       setStatus('Recording...')
       setStatusColor('#e8450a')
       animateWave(true)
       let s = 0
-      timerRef.current = setInterval(() => {
-        s++
-        setSeconds(s)
-      }, 1000)
+      timerRef.current = setInterval(() => { s++; setSeconds(s) }, 1000)
+
     } else {
+      // --- stop recording ---
       clearInterval(timerRef.current!)
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop()
+      }
       setRecording(false)
       setStatus('Recording saved ✓')
       setStatusColor('#2d7a4f')
@@ -78,13 +155,27 @@ export default function CenterPanel({ params, onGenerated }: Props) {
   }
 
   async function handleGenerate() {
-    if (recording) toggleRecord()
-    setGenerating(true)
-    setStatus('Processing your melody...')
-    setStatusColor('#bbb')
-    animateWave(false)
+    // stop mic if still running
+    if (recording) {
+      clearInterval(timerRef.current!)
+      mediaRecorderRef.current?.stop()
+      setRecording(false)
+      animateWave(false)
+      // wait for onstop to finish writing the blob
+      await new Promise(r => setTimeout(r, 300))
+    }
 
-    // sweep
+    if (!audioBlobRef.current) {
+      setStatus('No recording found — try again.')
+      setStatusColor('#e8450a')
+      return
+    }
+
+    setGenerating(true)
+    setStatus('Uploading your melody...')
+    setStatusColor('#bbb')
+
+    // sweep animation
     barsRef.current.forEach((b, i) => {
       setTimeout(() => { b.style.background = '#e8450a'; b.style.height = '3px' }, i * 12)
     })
@@ -98,28 +189,49 @@ export default function CenterPanel({ params, onGenerated }: Props) {
         b.style.background = '#e8450a'
       })
     }, 55)
-    await generateTrack([], params)
-    clearInterval(gi)
 
-    setGenerating(false)
-    setGenerated(true)
-    setStatus('Your track is ready')
-    setStatusColor('#2d7a4f')
-    animateWave(false)
-    barsRef.current.forEach(b => { b.style.height = '3px'; b.style.background = '#ebebeb' })
-    onGenerated()
+    try {
+      // 1. upload to Supabase — backend watches the bucket and kicks off
+      //    Basic Pitch → Nemoclaw → FluidSynth automatically
+      const baseMime = mimeTypeRef.current.split(';')[0]
+      const storagePath = await uploadRecording(audioBlobRef.current, baseMime)
+
+      // 2. poll for the finished MP3
+      setStatus('Generating your track...')
+      const url = await pollForResult(storagePath)
+      setMp3Url(url)
+
+      clearInterval(gi)
+      setGenerating(false)
+      setGenerated(true)
+      setStatus('Your track is ready')
+      setStatusColor('#2d7a4f')
+      animateWave(false)
+      barsRef.current.forEach(b => { b.style.height = '3px'; b.style.background = '#ebebeb' })
+      onGenerated()
+    } catch (err) {
+      clearInterval(gi)
+      setGenerating(false)
+      setStatus((err as Error).message ?? 'Something went wrong.')
+      setStatusColor('#e8450a')
+      animateWave(false)
+    }
   }
 
   function togglePlay() {
+    if (!mp3Url) return
     if (!playing) {
+      if (!audioRef.current) audioRef.current = new Audio(mp3Url)
+      audioRef.current.play()
       setPlaying(true)
       let p = progress
       playRef.current = setInterval(() => {
         p += 1.2
-        if (p >= 100) p = 0
+        if (p >= 100) { p = 0; setPlaying(false); clearInterval(playRef.current!) }
         setProgress(Math.round(p))
       }, 100)
     } else {
+      audioRef.current?.pause()
       setPlaying(false)
       clearInterval(playRef.current!)
     }
@@ -129,8 +241,14 @@ export default function CenterPanel({ params, onGenerated }: Props) {
     clearInterval(timerRef.current!)
     clearInterval(waveRef.current!)
     clearInterval(playRef.current!)
+    if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop()
+    audioRef.current?.pause()
+    audioRef.current = null
+    audioBlobRef.current = null
+    analyserRef.current  = null
     setRecording(false); setGenerated(false); setPlaying(false)
     setSeconds(0); setProgress(0); setGenerating(false)
+    setMp3Url(''); setMicError('')
     setStatus('Tap the mic to begin'); setStatusColor('#bbb')
     animateWave(false)
   }
@@ -147,7 +265,6 @@ export default function CenterPanel({ params, onGenerated }: Props) {
 
       {/* Orbit */}
       <div className="relative w-[160px] h-[160px] mb-6">
-        {/* rings */}
         <div className="absolute inset-0 rounded-full border border-[#ebebeb] humit-spin-cw-slow">
           <div className="absolute top-[-3px] left-1/2 -ml-[3px] w-[7px] h-[7px] rounded-full bg-[#e8450a]" />
         </div>
@@ -158,12 +275,10 @@ export default function CenterPanel({ params, onGenerated }: Props) {
           <div className="absolute top-1/2 right-[-3px] -mt-[3px] w-[7px] h-[7px] rounded-full bg-[#e8450a]" />
         </div>
 
-        {/* pulse ring */}
         {recording && (
-          <div className="absolute top-1/2 left-1/2 w-[62px] h-[62px] rounded-full border-[1.5px] border-[#e8450a] humit-pulse pointer-events-none" />
+          <div className="absolute top-1/2 left-1/2 w-[62px] h-[62px] rounded-full border-[1.5px] border-[#e8450a] humit-pulse pointer-events-none" style={{ transform: 'translate(-50%, -50%)' }} />
         )}
 
-        {/* mic button */}
         <button
           onClick={toggleRecord}
           className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[62px] h-[62px] rounded-full bg-white flex items-center justify-center z-10 transition-all border ${
@@ -180,7 +295,12 @@ export default function CenterPanel({ params, onGenerated }: Props) {
       {/* Waveform */}
       <div ref={waveContRef} className="flex items-center gap-[2.5px] h-[44px] w-full max-w-[360px] mb-3" />
 
-      <p className="humit-font-sans text-[11px] h-[18px] text-center mb-1 transition-colors" style={{ color: statusColor }}>{status}</p>
+      {micError ? (
+        <p className="humit-font-sans text-[11px] h-[18px] text-center mb-1 text-[#e8450a]">{micError}</p>
+      ) : (
+        <p className="humit-font-sans text-[11px] h-[18px] text-center mb-1 transition-colors" style={{ color: statusColor }}>{status}</p>
+      )}
+
       <p className="humit-font-sans font-light text-[34px] text-center mb-5 tracking-tight transition-colors" style={{ color: seconds > 0 ? '#1a1a1a' : '#ddd' }}>
         {timeStr}
       </p>
@@ -225,9 +345,12 @@ export default function CenterPanel({ params, onGenerated }: Props) {
                 className="humit-font-sans flex-1 py-2 rounded-[9px] text-[11px] bg-[#fafaf8] text-[#aaa] border border-[#ebebeb] hover:border-[#ccc] hover:text-[#555] transition-all">
                 ↩ Redo
               </button>
-              <button className="humit-font-sans flex-1 py-2 rounded-[9px] text-[11px] bg-[#fafaf8] text-[#aaa] border border-[#ebebeb] hover:border-[#ccc] hover:text-[#555] transition-all">
-                ↓ MP3
-              </button>
+              {mp3Url && (
+                <a href={mp3Url} download
+                  className="humit-font-sans flex-1 py-2 rounded-[9px] text-[11px] bg-[#fafaf8] text-[#aaa] border border-[#ebebeb] hover:border-[#ccc] hover:text-[#555] transition-all text-center">
+                  ↓ MP3
+                </a>
+              )}
             </div>
           </div>
         </div>
