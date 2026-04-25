@@ -1,8 +1,53 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { uploadRecording, pollForResult } from '../../../lib/api'
+import { uploadRecording, generateTrack } from '../../../lib/api'
 import { TrackParams } from './types'
+
+function writeString(view: DataView, offset: number, s: string) {
+  for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i))
+}
+
+async function blobToWav(blob: Blob): Promise<Blob> {
+  const arrayBuffer = await blob.arrayBuffer()
+  const audioCtx = new AudioContext()
+  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+  await audioCtx.close()
+
+  const numChannels = audioBuffer.numberOfChannels
+  const sampleRate  = audioBuffer.sampleRate
+  const numSamples  = audioBuffer.length
+  const bitsPerSample = 16
+  const dataLength  = numSamples * numChannels * 2  // 2 bytes per sample
+
+  const interleaved = new Int16Array(numSamples * numChannels)
+  for (let ch = 0; ch < numChannels; ch++) {
+    const chData = audioBuffer.getChannelData(ch)
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.max(-1, Math.min(1, chData[i]))
+      interleaved[i * numChannels + ch] = s < 0 ? s * 0x8000 : s * 0x7fff
+    }
+  }
+
+  const wavBuffer = new ArrayBuffer(44 + dataLength)
+  const view = new DataView(wavBuffer)
+  writeString(view, 0, 'RIFF')
+  view.setUint32(4, 36 + dataLength, true)
+  writeString(view, 8, 'WAVE')
+  writeString(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)                                         // PCM
+  view.setUint16(22, numChannels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * numChannels * 2, true)              // byte rate
+  view.setUint16(32, numChannels * 2, true)                           // block align
+  view.setUint16(34, bitsPerSample, true)
+  writeString(view, 36, 'data')
+  view.setUint32(40, dataLength, true)
+  new Int16Array(wavBuffer, 44).set(interleaved)
+
+  return new Blob([wavBuffer], { type: 'audio/wav' })
+}
 
 interface Props {
   params: TrackParams
@@ -191,14 +236,14 @@ export default function CenterPanel({ params, onGenerated }: Props) {
     }, 55)
 
     try {
-      // 1. upload to Supabase — backend watches the bucket and kicks off
-      //    Basic Pitch → Nemoclaw → FluidSynth automatically
-      const baseMime = mimeTypeRef.current.split(';')[0]
-      const storagePath = await uploadRecording(audioBlobRef.current, baseMime)
+      // 1. convert to WAV then upload to Supabase input/
+      setStatus('Converting to WAV...')
+      const wavBlob = await blobToWav(audioBlobRef.current)
+      const { inputPath, outputPath } = await uploadRecording(wavBlob)
 
-      // 2. poll for the finished MP3
+      // 2. call backend: Basic Pitch → NemoClaw → FluidSynth → Supabase output/
       setStatus('Generating your track...')
-      const url = await pollForResult(storagePath)
+      const url = await generateTrack(inputPath, outputPath)
       setMp3Url(url)
 
       clearInterval(gi)

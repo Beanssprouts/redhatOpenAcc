@@ -1,45 +1,49 @@
 import { supabase, AUDIO_BUCKET } from './supabase'
 import { TrackParams } from '../app/components/HumIt/types'
 
-// Uploads the recorded audio blob to Supabase Storage.
-// Returns the storage path so the backend can pick it up.
-export async function uploadRecording(blob: Blob, mimeType: string): Promise<string> {
-  const ext = mimeType.includes('mp4') ? 'm4a' : mimeType.includes('ogg') ? 'ogg' : 'webm'
-  const fileName = `recording-${Date.now()}.${ext}`
-  const path = `input/${fileName}`
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'
+
+// Uploads the recorded audio blob (WAV) to Supabase Storage.
+// Returns { inputPath, outputPath } so the backend knows where to read from and write to.
+export async function uploadRecording(
+  blob: Blob
+): Promise<{ inputPath: string; outputPath: string }> {
+  const fileName = `recording-${Date.now()}`
+  const inputPath = `input/${fileName}.wav`
+  const outputPath = `output/${fileName}.mp3`
 
   const { error } = await supabase.storage
     .from(AUDIO_BUCKET)
-    .upload(path, blob, { contentType: mimeType, upsert: false })
+    .upload(inputPath, blob, { contentType: 'audio/wav', upsert: false })
 
   if (error) throw new Error(`Upload failed: ${error.message}`)
-  return path
+  return { inputPath, outputPath }
 }
 
-// Polls Supabase Storage for the finished MP3.
-// The backend is expected to write to output/<same-filename>.mp3
-export async function pollForResult(
+// Calls the backend to run the full pipeline:
+// Basic Pitch → NemoClaw → FluidSynth → uploads MP3 to Supabase output/
+// Returns the public URL of the finished MP3.
+export async function generateTrack(
   inputPath: string,
-  timeoutMs = 60_000
+  outputPath: string
 ): Promise<string> {
-  const outputPath = inputPath.replace('input/', 'output/').replace(/\.\w+$/, '.mp3')
-  const deadline = Date.now() + timeoutMs
+  const { data: urlData } = supabase.storage
+    .from(AUDIO_BUCKET)
+    .getPublicUrl(inputPath)
 
-  while (Date.now() < deadline) {
-    const { data } = await supabase.storage.from(AUDIO_BUCKET).list(
-      outputPath.split('/').slice(0, -1).join('/'),
-      { search: outputPath.split('/').pop() }
-    )
-    if (data && data.length > 0) {
-      const { data: urlData } = supabase.storage
-        .from(AUDIO_BUCKET)
-        .getPublicUrl(outputPath)
-      return urlData.publicUrl
-    }
-    await new Promise(r => setTimeout(r, 3000))
+  const res = await fetch(`${BACKEND_URL}/api/v1/midi/convert`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ wav_url: urlData.publicUrl, output_path: outputPath }),
+  })
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Track generation failed: ${err}`)
   }
 
-  throw new Error('Timed out waiting for track generation')
+  const json = await res.json()
+  return json.mp3_url as string
 }
 
 export async function refineTrack(
