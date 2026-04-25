@@ -1,0 +1,58 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500&family=DM+Serif+Display:ital@0;1&display=swap');
+
+.humit-font-serif {
+  font-family: 'DM Serif Display', serif;
+}
+
+.humit-font-sans {
+  font-family: 'DM Sans', sans-serif;
+}
+
+/* Topbar status dot */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.humit-blink {
+  animation: blink 2s infinite;
+}
+
+/* Orbit rings */
+@keyframes spin-cw {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes spin-ccw {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(-360deg); }
+}
+.humit-spin-cw-slow  { animation: spin-cw  12s linear infinite; }
+.humit-spin-ccw-med  { animation: spin-ccw  8s linear infinite; }
+.humit-spin-cw-fast  { animation: spin-cw   5s linear infinite; }
+
+/* Pulse ring (only visible while recording) */
+@keyframes pulseRing {
+  0%   { transform: translate(-50%, -50%) scale(1);   opacity: 0.5; }
+  100% { transform: translate(-50%, -50%) scale(2.4); opacity: 0;   }
+}
+.humit-pulse {
+  animation: pulseRing 1.5s ease-out infinite;
+}
+
+/* Track card slide up */
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0);    }
+}
+.humit-slide-up {
+  animation: slideUp 0.35s ease forwards;
+}
+
+/* Chat bubble pop in */
+@keyframes popIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1);    }
+}
+.humit-pop-in {
+  animation: popIn 0.2s ease forwards;
+}
